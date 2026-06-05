@@ -1,0 +1,279 @@
+#작동 방법 : cmd창에 아래 두 줄 작성하면 됩니다!
+
+#cd C:\Users\bc052\Desktop\"프로젝트 위치"
+#cd C:\Users\bc052\Desktop\졸업프로젝트
+#python -m streamlit run 졸업프로젝트1.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from openai import OpenAI
+from streamlit_echarts import st_echarts
+import json
+import time
+
+# ==========================================
+# 0. 최상단 설정 및 Data Bridge 수신
+# ==========================================
+st.set_page_config(page_title="Sentitype: 적응형 AI 상담", layout="wide")
+
+# URL 파라미터를 통해 JavaScript에서 전송한 KSD 데이터와 프롬프트를 수신
+if "ksd_data" in st.query_params:
+    try:
+        st.session_state.last_ksd_from_js = json.loads(st.query_params["ksd_data"])
+        if "prompt" in st.query_params:
+            st.session_state.pending_prompt = st.query_params["prompt"]
+        
+        # 파라미터 처리 후 URL 정리 및 재실행하여 루프 방지
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Data Bridge 수신 오류: {e}")
+
+# ==========================================
+# 1. 환경 설정 및 API 키 입력
+# ==========================================
+API_KEY = ""
+
+# [수정] API 키 검증 로직 정상화
+if API_KEY == "" or not API_KEY.startswith("sk-"):
+    st.error("⚠️ 올바른 OpenAI API 키를 넣어주세요.")
+    client = None 
+else:
+    try:
+        client = OpenAI(api_key=API_KEY)
+    except Exception as e:
+        st.error(f"API 연결 중 오류 발생: {e}")
+        client = None
+
+# ==========================================
+# 2. 세션 상태 초기화
+# ==========================================
+if "weights" not in st.session_state:
+    st.session_state.weights = {
+        "hesitation_threshold": 1.5,  
+        "correction_limit": 0.2,      
+        "dwell_stress_limit": 1.2,    
+        "learning_rate": 0.1         
+    }
+
+if "baseline" not in st.session_state: st.session_state.baseline = None
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
+if "ksd_history" not in st.session_state: st.session_state.ksd_history = {"dwell_means": []}
+
+# ==========================================
+# 3. JavaScript Bridge (실시간 URL 리다이렉트 방식)
+# ==========================================
+def capture_ksd(label=""):
+    # [보안 우회 완료 버전] 브라우저 정책을 우회하여 URL 파라미터를 안전하게 전송합니다.
+    js_template = """
+    <div id="ksd-container">
+        <p style="color: #333; font-weight: bold; font-size: 0.9rem;">{label}</p>
+        <input type="text" id="ksd-input" style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #ccc;" placeholder="여기에 입력하고 Enter를 누르세요...">
+    </div>
+    <script>
+    let keyData = { dwell: [], flight: [], corrections: 0, total: 0 };
+    let lastUp = 0;
+    let keyMap = {};
+    const inputField = document.getElementById('ksd-input');
+
+    inputField.addEventListener('keydown', (e) => {
+        const now = performance.now();
+        if (!keyMap[e.key]) {
+            keyMap[e.key] = now;
+            if (lastUp > 0) keyData.flight.push(now - lastUp);
+        }
+        if (e.key === 'Backspace' || e.key === 'Delete') keyData.corrections++;
+        keyData.total++;
+    });
+
+    inputField.addEventListener('keyup', (e) => {
+        const now = performance.now();
+        if (keyMap[e.key]) {
+            keyData.dwell.push(now - keyMap[e.key]);
+            delete keyMap[e.key];
+            lastUp = now;
+        }
+        
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (!inputField.value.trim()) return;
+            
+            try {
+                // 핵심 수정: window.top.location.href를 '읽는' 것은 보안상 차단되므로,
+                // 안전하게 부모 주소를 가리키는 document.referrer를 사용합니다.
+                let parentUrl = document.referrer || window.parent.location.href;
+                if (!parentUrl || parentUrl === "about:srcdoc") {
+                    parentUrl = window.top.location.ancestorOrigins[0] || "http://localhost:8501/";
+                }
+                
+                const url = new URL(parentUrl);
+                url.searchParams.set('ksd_data', JSON.stringify(keyData));
+                url.searchParams.set('prompt', inputField.value);
+                url.searchParams.set('t', Date.now()); // 강제 갱신용 타임스탬프
+                
+                // 부모 창의 주소를 '바꾸는(Write)' 이동 행위는 브라우저 보안에 걸리지 않습니다.
+                window.top.location.href = url.href;
+            } catch (err) {
+                console.error("보안 정책으로 인한 리다이렉트 실패, 대체 메커니즘 구동:", err);
+                // 예외 발생 시 강제 주소 입력 방식으로 2차 우회
+                const fallbackUrl = "http://localhost:8501/?ksd_data=" + encodeURIComponent(JSON.stringify(keyData)) + "&prompt=" + encodeURIComponent(inputField.value) + "&t=" + Date.now();
+                window.top.location.href = fallbackUrl;
+            }
+        }
+    });
+    
+    setTimeout(() => inputField.focus(), 100);
+    </script>
+    """
+    js_component = js_template.replace("{label}", label)
+    st.components.v1.html(js_component, height=120)
+
+# ==========================================
+# 4. 감정 추론 알고리즘 및 전략 엔진
+# ==========================================
+def get_emotion_profile(ksd_data, base, w):
+    flights = ksd_data.get('flight', [])
+    dwells = ksd_data.get('dwell', [])
+    
+    f_mean = np.mean(flights) if flights else base['f_mu']
+    z_flight = (f_mean - base['f_mu']) / (base['f_sigma'] + 1e-5)
+    corr_rate = ksd_data.get('corrections', 0) / (ksd_data.get('total', 1) + 1e-5)
+    
+    d_mean = np.mean(dwells) if dwells else base['d_mu']
+    if dwells:
+        st.session_state.ksd_history["dwell_means"].append(d_mean)
+
+    if len(st.session_state.ksd_history["dwell_means"]) > 1:
+        initial_dwell = np.mean(st.session_state.ksd_history["dwell_means"][:3])
+        fatigue_ratio = (d_mean / initial_dwell) - 1.0  
+    else:
+        fatigue_ratio = 0.0
+
+    scores = {
+        "망설임": round(float(np.clip(0.3 + (z_flight / w['hesitation_threshold'] * 0.4), 0.1, 0.9)), 2),
+        "초조함": round(float(np.clip(corr_rate / w['correction_limit'], 0.1, 0.9)), 2),
+        "피로감": round(float(np.clip(0.2 + (fatigue_ratio / (w['dwell_stress_limit'] - 1.0 + 1e-5) * 0.5), 0.1, 0.9)), 2)
+    }
+    return scores
+
+# [수정] 중복 정의 제거 및 C 전략 스크립트 결합
+def generate_strategy_info(emo, mode):
+    if "A" in mode:
+        return f"현재 사용자의 KSD 심리 지표 점수: {emo}"
+    if "B" in mode:
+        dominant = max(emo, key=emo.get)
+        return f"현재 사용자는 {dominant} 상태가 두드러집니다. 점수: {emo}"
+    
+    guidelines = []
+    if emo['망설임'] > 0.6:
+        guidelines.append("사용자가 답변을 망설이고 있으니, 선택지를 좁혀주거나 구체적인 질문으로 답변을 유도하세요.")
+    if emo['초조함'] > 0.6:
+        guidelines.append("사용자가 문장을 계속 수정하는 초조함을 보입니다. '천천히 말해도 괜찮다'는 정서적 지지를 보내세요.")
+    if emo['피로감'] > 0.6:
+        guidelines.append("사용자의 인지 피로도가 높습니다. 답변을 평소보다 짧고 간결하게 구성하고, 명확한 위로를 전하세요.")
+    
+    return " / ".join(guidelines) if guidelines else "사용자의 입력 리듬이 안정적입니다. 자연스러운 대화를 이어가세요."
+
+# ==========================================
+# 5. 웹 메인 레이아웃 (Streamlit)
+# ==========================================
+st.sidebar.title("Counseling Strategy")
+mode = st.sidebar.radio("프롬프트 전략", ["A: 수치형 (Numeric)", "B: 서술형 (Descriptive)", "C: 지침형 (Instructional)"])
+
+# 1단계: Baseline 수집
+if not st.session_state.baseline:
+    st.header("타이핑 패턴 분석 기반의 적응형 AI 상담 서비스")
+    st.write("상담을 시작하기 위해 아래 문장을 입력해 주세요.")
+    st.info("'타이핑 패턴 분석 기반의 적응형 AI 상담 서비스 사용에 동의합니다.'")
+    
+    capture_ksd("위 문장을 똑같이 입력하고 엔터를 누르세요")
+    
+    if "last_ksd_from_js" in st.session_state and st.session_state.last_ksd_from_js:
+        data = st.session_state.pop("last_ksd_from_js")
+        if len(data.get('dwell', [])) > 5:
+            st.session_state.baseline = {
+                'f_mu': np.mean(data['flight']), 'f_sigma': np.std(data['flight']),
+                'd_mu': np.mean(data['dwell']), 'd_sigma': np.std(data['dwell'])
+            }
+            st.session_state.pop("pending_prompt", None)
+            st.success("개인별 타이핑 Baseline 수집 완료! 상담 세션으로 이동합니다.")
+            time.sleep(1)
+            st.rerun()
+
+# 2단계: 메인 상담 화면
+else:
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.header("적응형 AI 상담")
+        for m in st.session_state.chat_history:
+            with st.chat_message(m["role"]):
+                st.write(m["content"])
+                if m["role"] == "assistant" and "emo_snapshot" in m:
+                    emo = m["emo_snapshot"]
+                    st.caption(f"📊 분석된 상태: 망설임({emo['망설임']}) | 초조함({emo['초조함']}) | 피로도({emo['피로감']})")
+                    if "gen_content" in m:
+                        with st.expander("🔍 일반 답변과 비교하기"): st.info(m["gen_content"])
+
+        capture_ksd("메시지를 입력하고 엔터를 누르세요")
+        
+        if "pending_prompt" in st.session_state:
+            prompt = st.session_state.pop("pending_prompt")
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            
+            raw_ksd = st.session_state.pop('last_ksd_from_js', {'dwell':[], 'flight':[], 'corrections':0, 'total':1})
+            current_emo = get_emotion_profile(raw_ksd, st.session_state.baseline, st.session_state.weights)
+            st.session_state.last_emo = current_emo
+
+            info = generate_strategy_info(current_emo, mode)
+
+            if client:
+                try:
+                    res_gen = client.chat.completions.create(
+                        model="gpt-4o", messages=[{"role": "system", "content": "당신은 공감 능력이 뛰어난 상담가입니다."}, {"role": "user", "content": prompt}]
+                    )
+                    answer_gen = res_gen.choices[0].message.content
+
+                    res_ksd = client.chat.completions.create(
+                        model="gpt-4o", messages=[{"role": "system", "content": f"당신은 공감 능력이 뛰어난 상담가입니다. {info}"}, {"role": "user", "content": prompt}]
+                    )
+                    answer_ksd = res_ksd.choices[0].message.content
+                    
+                    st.session_state.chat_history.append({
+                        "role": "assistant", "content": answer_ksd, "gen_content": answer_gen, "emo_snapshot": current_emo
+                    })
+                except Exception as e:
+                    st.error(f"GPT 호출 중 오류 발생: {e}")
+            st.rerun()
+
+    with col2:
+        st.header("감정 모니터링")
+        if "last_emo" in st.session_state:
+            emo_data = st.session_state.last_emo
+            options = {
+                "radar": {"indicator": [{"name": k, "max": 1} for k in emo_data.keys()], "splitNumber": 4},
+                "series": [{"type": "radar", "data": [{"value": list(emo_data.values()), "name": "Emotion State"}], "areaStyle": {"color": "rgba(255, 99, 132, 0.2)"}}]
+            }
+            st_echarts(options, height="400px")
+
+        st.divider()
+        st.subheader("모델 최적화 (Feedback)")
+        target = st.selectbox("수정이 필요한 감정", ["없음", "망설임", "초조함", "피로감"])
+        if target != "없음":
+            actual_level = st.slider(f"실제 느낀 '{target}' 정도 (0:낮음 ~ 1:높음)", 0.0, 1.0, 0.5)
+            if st.button("가중치 업데이트"):
+                lr = st.session_state.weights['learning_rate']
+                error = st.session_state.last_emo[target] - actual_level
+                
+                # [수정] 초조함과 피로감 가중치 피드백 수학적 모델 전 지표 확장
+                if target == "망설임":
+                    st.session_state.weights['hesitation_threshold'] += error * lr
+                elif target == "초조함":
+                    st.session_state.weights['correction_limit'] -= error * lr
+                elif target == "피로감":
+                    st.session_state.weights['dwell_stress_limit'] += error * lr
+                st.success(f"가중치 반영 완료. 이제 '{target}' 분석이 더 정교해집니다.")
+
+if st.session_state.baseline:
+    if st.button("최종 가중치 결과 확인"): st.json(st.session_state.weights)
