@@ -12,9 +12,8 @@ from streamlit_echarts import st_echarts
 import json
 import time
 
-# ==========================================
-# 0. 최상단 설정 및 Data Bridge 수신
-# ==========================================
+# 최상단 설정 및 Data Bridge 수신
+
 st.set_page_config(page_title="Sentitype: 적응형 AI 상담", layout="wide")
 
 # URL 파라미터를 통해 JavaScript에서 전송한 KSD 데이터와 프롬프트를 수신
@@ -24,20 +23,19 @@ if "ksd_data" in st.query_params:
         if "prompt" in st.query_params:
             st.session_state.pending_prompt = st.query_params["prompt"]
         
-        # 파라미터 처리 후 URL 정리 및 재실행하여 루프 방지
         st.query_params.clear()
         st.rerun()
     except Exception as e:
         st.error(f"Data Bridge 수신 오류: {e}")
 
-# ==========================================
+
 # 1. 환경 설정 및 API 키 입력
-# ==========================================
+
 API_KEY = ""
 
 # [수정] API 키 검증 로직 정상화
 if API_KEY == "" or not API_KEY.startswith("sk-"):
-    st.error("⚠️ 올바른 OpenAI API 키를 넣어주세요.")
+    st.error(" 올바른 OpenAI API 키를 넣어주세요.")
     client = None 
 else:
     try:
@@ -46,9 +44,9 @@ else:
         st.error(f"API 연결 중 오류 발생: {e}")
         client = None
 
-# ==========================================
+
 # 2. 세션 상태 초기화
-# ==========================================
+
 if "weights" not in st.session_state:
     st.session_state.weights = {
         "hesitation_threshold": 1.5,  
@@ -61,9 +59,9 @@ if "baseline" not in st.session_state: st.session_state.baseline = None
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
 if "ksd_history" not in st.session_state: st.session_state.ksd_history = {"dwell_means": []}
 
-# ==========================================
-# 3. JavaScript Bridge (실시간 URL 리다이렉트 방식)
-# ==========================================
+
+# 3. JavaScript Bridge 
+
 def capture_ksd(label=""):
     # [보안 우회 완료 버전] 브라우저 정책을 우회하여 URL 파라미터를 안전하게 전송합니다.
     js_template = """
@@ -129,9 +127,9 @@ def capture_ksd(label=""):
     js_component = js_template.replace("{label}", label)
     st.components.v1.html(js_component, height=120)
 
-# ==========================================
+
 # 4. 감정 추론 알고리즘 및 전략 엔진
-# ==========================================
+
 def get_emotion_profile(ksd_data, base, w):
     flights = ksd_data.get('flight', [])
     dwells = ksd_data.get('dwell', [])
@@ -157,7 +155,7 @@ def get_emotion_profile(ksd_data, base, w):
     }
     return scores
 
-# [수정] 중복 정의 제거 및 C 전략 스크립트 결합
+#중복 정의 제거 및 C 전략 스크립트 결합
 def generate_strategy_info(emo, mode):
     if "A" in mode:
         return f"현재 사용자의 KSD 심리 지표 점수: {emo}"
@@ -175,13 +173,13 @@ def generate_strategy_info(emo, mode):
     
     return " / ".join(guidelines) if guidelines else "사용자의 입력 리듬이 안정적입니다. 자연스러운 대화를 이어가세요."
 
-# ==========================================
+
 # 5. 웹 메인 레이아웃 (Streamlit)
-# ==========================================
+
 st.sidebar.title("Counseling Strategy")
 mode = st.sidebar.radio("프롬프트 전략", ["A: 수치형 (Numeric)", "B: 서술형 (Descriptive)", "C: 지침형 (Instructional)"])
 
-# 1단계: Baseline 수집
+# Baseline 수집
 if not st.session_state.baseline:
     st.header("타이핑 패턴 분석 기반의 적응형 AI 상담 서비스")
     st.write("상담을 시작하기 위해 아래 문장을 입력해 주세요.")
@@ -201,7 +199,7 @@ if not st.session_state.baseline:
             time.sleep(1)
             st.rerun()
 
-# 2단계: 메인 상담 화면
+# 메인 상담 화면
 else:
     col1, col2 = st.columns([2, 1])
 
